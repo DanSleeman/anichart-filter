@@ -1,6 +1,6 @@
 // ==UserScript==
-// @name         AniChart Filter Mutation Observer
-// @version      1.0
+// @name         AniChart Filter
+// @version      2.0
 // @description  Filter AniChart cards based on the color of the highlight
 // @author       David Gouveia
 // @author       Dan Sleeman
@@ -11,21 +11,34 @@
 (function() {
   "use strict";
 
-  var list = [];
+  const STORAGE_KEY = "anichart-selected-filters";
+  const SELECTED_COLORS = new Set(JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"));
+  const REFRESH_DEBOUNCE_MS = 180;
+  const KNOWN_COLORS = ["green", "yellow", "red", "gray"];
+  const COLOR_RE = /--color-([a-z]+)/i;
 
-  function initialize() {
-    initializeCss();
-    initializeHtml();
-    refresh();
+  let refreshTimer = null;
+  let mainObserver = null;
+
+
+  function saveState() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify([...SELECTED_COLORS]));
+  }
+
+  function debounceRefresh() {
+    // debounce refresh so many rapid DOM mutations don't hammer the function
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => {
+      refresh();
+      refreshTimer = null;
+    }, REFRESH_DEBOUNCE_MS);
   }
 
   function initializeCss() {
-    if (document.getElementById("anichart-filter-css") != null) return;
-
-    let css = document.createElement("style");
+    if (document.getElementById("anichart-filter-css")) return;
+    const css = document.createElement("style");
     css.id = "anichart-filter-css";
-    css.type = "text/css";
-    css.innerHTML = `
+    css.textContent = `
       .anichart-filter-html {
         display: inline-block;
         height: 25px;
@@ -38,6 +51,7 @@
         position: relative;
         cursor: pointer;
         user-select: none;
+        margin-right: 6px;
       }
       .anichart-filter-checkbox input {
         position: absolute;
@@ -83,84 +97,145 @@
       .anichart-filter-card-aired {
         outline: 2px dashed green;
       }`;
-    document.body.appendChild(css);
+    document.head.appendChild(css);
   }
 
   function initializeHtml() {
-    if (document.getElementById("anichart-filter-html") != null) return;
-
-    let filters = document.getElementsByClassName("filters");
-    if (filters.length == 0) return;
-
-    var item = document.createElement("div");
-    item.id = "anichart-filter-html";
-    item.classList.add("anichart-filter-html");
-    item.innerHTML = `
-      <label class="anichart-filter-checkbox"><input type="checkbox" value="green"><span class="anichart-filter-checkmark green"></span></label>
-      <label class="anichart-filter-checkbox"><input type="checkbox" value="yellow"><span class="anichart-filter-checkmark yellow"></span></label>
-      <label class="anichart-filter-checkbox"><input type="checkbox" value="red"><span class="anichart-filter-checkmark red"></span></label>
-      <label class="anichart-filter-checkbox"><input type="checkbox" value="gray"><span class="anichart-filter-checkmark gray"></span></label>`;
-
-    let parent = filters[0];
-    parent.insertBefore(item, parent.children[0]);
-
-    let inputs = item.getElementsByTagName("input");
-    for (let input of inputs) {
-      input.addEventListener("click", onCheckboxClicked);
+    // If already present, just ensure listeners and checked state are correct
+    let root = document.getElementById("anichart-filter-html");
+    if (!root) {
+      const filters = document.getElementsByClassName("filters");
+      if (filters.length === 0) return;
+      root = document.createElement("div");
+      root.id = "anichart-filter-html";
+      root.className = "anichart-filter-html";
+      root.innerHTML = KNOWN_COLORS.map(color =>
+        `<label class="anichart-filter-checkbox"><input type="checkbox" value="${color}"><span class="anichart-filter-checkmark ${color}"></span></label>`
+      ).join("");
+      filters[0].insertBefore(root, filters[0].children[0] || null);
     }
 
-    list = [];
+    // Attach listeners and restore check state (idempotent)
+    const inputs = root.getElementsByTagName("input");
+    for (let input of inputs) {
+      if (!input._anichart_listening) {
+        input.addEventListener("change", onCheckboxClicked);
+        input._anichart_listening = true;
+      }
+      input.checked = SELECTED_COLORS.has(input.value);
+    };
   }
 
-  function onCheckboxClicked(event) {
-    function arrayRemove(arr, value) {
-      return arr.filter(ele => ele != value);
-    }
-    if (event.target.checked) {
-      list.push(event.target.value);
-    } else {
-      list = arrayRemove(list, event.target.value);
-    }
-    refresh();
+  function onCheckboxClicked(e) {
+    const v = e.target.value;
+    if (e.target.checked) SELECTED_COLORS.add(v);
+    else SELECTED_COLORS.delete(v);
+    saveState();
+    debounceRefresh();
   }
 
   function refresh() {
-    for (let card of document.getElementsByClassName("media-card")) {
-      let episode = card.getElementsByClassName("episode")[0];
-      if (episode && episode.innerHTML.includes("aired")) {
-        card.classList.add("anichart-filter-card-aired");
-      }
-      if (list.length == 0) {
-        card.style.display = "";
-      } else {
-        card.style.display = "none";
-        let highlighter = card.getElementsByClassName("highlighter")[0];
-        if (highlighter != null) {
-          let text = highlighter.style.cssText;
-          for (let color of list) {
-            if (
-              (color == "gray" && !text.includes("--color-")) ||
-              text.includes("--color-" + color)
-            ) {
-              card.style.display = "";
-              break;
-            }
-          }
+    try {
+      // Trigger event to trick lazy loading to show more cards. Needed when there are few cards shown to begin with.
+      window.dispatchEvent(new Event("resize"));
+      const cards = document.querySelectorAll('.media-card, .airing-card');
+      if (!cards || cards.length === 0) return;
+
+      const noFilters = SELECTED_COLORS.size === 0;
+
+      for (let i = 0; i < cards.length; i++) {
+        const card = cards[i];
+        const episode = card.getElementsByClassName("episode")[0];
+        if (episode && episode.textContent.includes("aired")) {
+          card.classList.add("anichart-filter-card-aired");
+        } else { // Sometimes the page loads with incorrect show data and currently airing shows have the "aired on" text in season pages.
+          card.classList.remove("anichart-filter-card-aired");
         }
+
+        const highlighter = card.getElementsByClassName("highlighter")[0];
+        if (!highlighter) continue;
+
+        const match = COLOR_RE.exec(highlighter.style.cssText);
+        let colorInCard = match ? match[1] : null;
+        let show = 
+          noFilters ||
+          (colorInCard && SELECTED_COLORS.has(colorInCard)) ||
+          (!colorInCard && SELECTED_COLORS.has("gray"));
+        card.style.display = show ? "" : "none";
       }
+    }
+    catch (err) {
+      console.error("anichart refresh error:", err);
     }
   }
 
-  const observer = new MutationObserver(mutations => {
-    for (const mutation of mutations) {
-      if (mutation.addedNodes.length > 0) {
-        initialize();
-        break;
+function setupObservers() {
+  if (mainObserver) return;
+
+  let pendingCardsChange = false;
+  let pendingFiltersChange = false;
+
+  mainObserver = new MutationObserver(mutations => {
+    for (const m of mutations) {
+      if (pendingCardsChange && pendingFiltersChange) break;
+
+      if (m.type === "childList") {
+        const allNodes = [...m.addedNodes, ...m.removedNodes];
+
+        for (const node of allNodes) {
+          if (node.nodeType !== 1) continue;
+
+          const cl = node.classList;
+
+          if (cl?.contains("filters") || node.querySelector?.(".filters")) {
+            pendingFiltersChange = true;
+          }
+
+          if (
+            cl?.contains("media-card") ||
+            cl?.contains("airing-card") ||
+            node.matches?.(".media-card *, .airing-card *") ||
+            node.querySelector?.(".media-card, .airing-card")
+          ) {
+            pendingCardsChange = true;
+          }
+
+          if (pendingCardsChange && pendingFiltersChange) break;
+        }
+      } 
+      else if (m.type === "attributes") {
+        const target = m.target;
+        if (target.closest?.(".media-card, .airing-card")) {
+          pendingCardsChange = true;
+        }
       }
+    }
+
+    if (pendingFiltersChange) {
+      pendingFiltersChange = false;
+      initializeHtml(); // idempotent
+    }
+
+    if (pendingCardsChange) {
+      pendingCardsChange = false;
+      debounceRefresh();
     }
   });
 
-  observer.observe(document.body, { childList: true, subtree: true });
+  mainObserver.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["style"] // This is needed for the lazy loading on initial page load
+  });
+}
+
+  function initialize() {
+    initializeCss();
+    initializeHtml();
+    setupObservers();
+    debounceRefresh();
+  }
 
   initialize();
 })();
